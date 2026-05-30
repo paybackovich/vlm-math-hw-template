@@ -28,7 +28,13 @@ def parse_mc_answer(text: str, choices: tuple[str, ...] = CHOICES) -> str | None
             "Answer: C"
             "The correct answer is D."
     """
-    raise NotImplementedError("Implement parse_mc_answer")
+    if not text:
+        return None
+    pattern = r"\b([" + "".join(choices) + r"])\b"
+    matches = re.findall(pattern, text.upper())
+    if not matches:
+        return None
+    return matches[-1]
 
 
 def build_benchmark_prompt(question: str, options: list[str]) -> str:
@@ -71,7 +77,110 @@ def run_benchmark(config: dict[str, Any], toy: bool = False) -> dict[str, float]
         - write predictions if output_path is provided;
         - return metrics.
     """
-    raise NotImplementedError("Implement benchmark loop")
+    import torch
+
+    from hw.backbones import build_backbones
+    from hw.dataset import MathVQADataset
+    from hw.model import MathVLM
+    from hw.processor import MathVLMProcessor, ProcessorConfig
+
+    data_cfg = config.get("data", {})
+    model_cfg = config.get("model", {})
+    proc_cfg = config.get("processor", {})
+    infer_cfg = config.get("inference", {})
+
+    manifest = data_cfg.get("eval_manifest") or data_cfg.get("train_manifest")
+    split = data_cfg.get("split", "dev")
+    max_samples = data_cfg.get("max_samples")
+    if toy:
+        max_samples = max_samples or 8
+
+    dataset = MathVQADataset(manifest, split=split, max_samples=max_samples)
+
+    device = torch.device(infer_cfg.get("device", "cpu"))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        device = torch.device("cpu")
+
+    processor_config = ProcessorConfig(
+        image_size=int(proc_cfg.get("image_size", 224)),
+        num_tiles=int(proc_cfg.get("num_tiles", 1)),
+        num_image_tokens=int(proc_cfg.get("num_image_tokens", 49)),
+        max_length=int(proc_cfg.get("max_length", 512)),
+        ignore_index=int(proc_cfg.get("ignore_index", -100)),
+    )
+
+    corpus = []
+    for i in range(len(dataset)):
+        s = dataset[i]
+        corpus.append(s.question)
+        corpus.extend(s.options)
+        corpus.append(s.answer)
+
+    vision_encoder, language_model, tokenizer, model_config = build_backbones(
+        model_cfg,
+        num_image_tokens=processor_config.num_image_tokens,
+        corpus=corpus,
+        force_mock=toy,
+    )
+    processor = MathVLMProcessor(tokenizer, processor_config)
+
+    model = MathVLM(vision_encoder, language_model, model_config)
+    model.freeze_backbones()
+
+    adapter_path = model_cfg.get("adapter_path")
+    if adapter_path and Path(adapter_path).exists():
+        if str(adapter_path).endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            state_dict = load_file(str(adapter_path))
+        else:
+            state_dict = torch.load(str(adapter_path), map_location="cpu")
+        model.adapter.load_state_dict(state_dict)
+        print(f"loaded adapter from {adapter_path}")
+
+    model.to(device)
+    model.eval()
+
+    max_new_tokens = int(infer_cfg.get("max_new_tokens", 16))
+    rows: list[dict[str, Any]] = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        prompt = processor.build_prompt(sample, include_answer=False)
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)[
+            : processor_config.max_length
+        ]
+        input_ids = torch.tensor(prompt_ids, dtype=torch.long)
+        batch = {
+            "input_ids": input_ids.unsqueeze(0).to(device),
+            "attention_mask": torch.ones_like(input_ids).unsqueeze(0).to(device),
+            "pixel_values": processor.preprocess_image(sample.image).unsqueeze(0).to(device),
+        }
+        gen_ids = model.generate(
+            batch, max_new_tokens=max_new_tokens, eos_token_id=tokenizer.eos_token_id
+        )
+        generated_text = tokenizer.decode(gen_ids[0].tolist())
+        prediction = parse_mc_answer(generated_text)
+        rows.append(
+            {
+                "id": sample.id,
+                "prediction": prediction,
+                "answer": sample.answer,
+                "subject": sample.subject,
+                "generated": generated_text,
+            }
+        )
+
+    output_path = infer_cfg.get("output_path")
+    if output_path:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"wrote {len(rows)} predictions to {output_path}")
+
+    metrics = compute_accuracy(rows)
+    return metrics
 
 
 def main() -> None:

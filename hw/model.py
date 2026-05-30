@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 @dataclass
@@ -29,13 +30,23 @@ class VisionToTextAdapter(nn.Module):
         self.text_hidden_size = text_hidden_size
         self.num_image_tokens = num_image_tokens
 
-        # TODO: replace with a small projection network.
-        # Recommended: LayerNorm -> Linear -> GELU -> Linear.
-        raise NotImplementedError("Implement VisionToTextAdapter.__init__")
+        self.norm = nn.LayerNorm(vision_hidden_size)
+        self.proj = nn.Sequential(
+            nn.Linear(vision_hidden_size, text_hidden_size),
+            nn.GELU(),
+            nn.Linear(text_hidden_size, text_hidden_size),
+        )
 
     def forward(self, vision_hidden_states: torch.Tensor) -> torch.Tensor:
         """Return visual embeddings [B, num_image_tokens, text_hidden_size]."""
-        raise NotImplementedError("Implement VisionToTextAdapter.forward")
+        x = self.norm(vision_hidden_states)
+        x = self.proj(x)  # [B, L, text_hidden_size]
+
+        if x.size(1) != self.num_image_tokens:
+            x = x.transpose(1, 2)  # [B, D, L]
+            x = F.adaptive_avg_pool1d(x, self.num_image_tokens)  # [B, D, K]
+            x = x.transpose(1, 2)  # [B, K, D]
+        return x
 
 
 def merge_visual_embeddings(
@@ -58,7 +69,13 @@ def merge_visual_embeddings(
     Assumption for public tests:
         each row has exactly K positions where input_ids == image_token_id.
     """
-    raise NotImplementedError("Implement visual/text embedding merge")
+    merged = input_embeds.clone()
+    mask = input_ids == image_token_id  # [B, L]
+    flat_visual = visual_embeds.reshape(-1, visual_embeds.size(-1)).to(
+        dtype=merged.dtype, device=merged.device
+    )
+    merged[mask] = flat_visual
+    return merged
 
 
 class MathVLM(nn.Module):
@@ -95,9 +112,70 @@ class MathVLM(nn.Module):
             - merge visual/text embeddings;
             - call language_model with inputs_embeds, attention_mask, labels.
         """
-        raise NotImplementedError("Implement MathVLM.forward")
+        input_ids = batch["input_ids"]
+        pixel_values = batch["pixel_values"]
+        b, t = pixel_values.shape[:2]
+
+        vision_out = self.vision_encoder(pixel_values.flatten(0, 1))
+        hidden = getattr(vision_out, "last_hidden_state", vision_out)
+        hidden = hidden.reshape(b, t * hidden.size(1), hidden.size(-1))
+        visual_embeds = self.adapter(hidden)
+
+        text_embeds = self.language_model.get_input_embeddings()(input_ids)
+        inputs_embeds = merge_visual_embeddings(
+            text_embeds, input_ids, visual_embeds, self.config.image_token_id
+        )
+        return self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=batch.get("attention_mask"),
+            labels=batch.get("labels"),
+        )
 
     @torch.no_grad()
     def generate(self, batch: dict[str, torch.Tensor], **generation_kwargs: Any) -> torch.Tensor:
         """Generate answer token ids."""
-        raise NotImplementedError("Implement MathVLM.generate")
+        max_new_tokens = int(generation_kwargs.pop("max_new_tokens", 16))
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        pixel_values = batch["pixel_values"]
+        b, t = pixel_values.shape[:2]
+
+        vision_out = self.vision_encoder(pixel_values.flatten(0, 1))
+        hidden = getattr(vision_out, "last_hidden_state", vision_out)
+        hidden = hidden.reshape(b, t * hidden.size(1), hidden.size(-1))
+        visual_embeds = self.adapter(hidden)
+
+        embed_layer = self.language_model.get_input_embeddings()
+        inputs_embeds = merge_visual_embeddings(
+            embed_layer(input_ids), input_ids, visual_embeds, self.config.image_token_id
+        )
+
+        if not getattr(self.language_model, "_is_mock", False) and hasattr(
+            self.language_model, "generate"
+        ):
+            return self.language_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                **generation_kwargs,
+            )
+
+        # Manual greedy decoding for the lightweight mock language model.
+        cur_embeds = inputs_embeds
+        cur_mask = attention_mask
+        eos_id = generation_kwargs.get("eos_token_id")
+        generated: list[torch.Tensor] = []
+        for _ in range(max_new_tokens):
+            out = self.language_model(inputs_embeds=cur_embeds, attention_mask=cur_mask)
+            logits = out.logits if hasattr(out, "logits") else out["logits"]
+            next_id = logits[:, -1, :].argmax(dim=-1)  # [B]
+            generated.append(next_id)
+            next_embed = embed_layer(next_id).unsqueeze(1)
+            cur_embeds = torch.cat([cur_embeds, next_embed], dim=1)
+            if cur_mask is not None:
+                cur_mask = torch.cat(
+                    [cur_mask, torch.ones_like(next_id).unsqueeze(1)], dim=1
+                )
+            if eos_id is not None and bool((next_id == eos_id).all()):
+                break
+        return torch.stack(generated, dim=1)  # [B, T_new]
